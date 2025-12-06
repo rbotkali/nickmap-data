@@ -1,0 +1,96 @@
+name: TRIM ONCE (manual)
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: trim-once
+  cancel-in-progress: false
+
+jobs:
+  trim:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # history 브랜치 생성 + 최신 main 스냅샷 저장(두 JSON만)
+      - name: ensure history & append snapshot
+        run: |
+          set -e
+          NOW=$(date -u +'%Y-%m-%d_%H-%M-%S')
+
+          # history 브랜치 없으면 만들기
+          if ! git ls-remote --exit-code --heads origin history >/dev/null 2>&1; then
+            git checkout --orphan history
+            git rm -r --cached . 2>/dev/null || true
+            echo "# history branch (7-day rotating snapshots)" > README.md
+            git add README.md
+            git commit -m "init history"
+            git push -u origin history
+          fi
+
+          # origin/main에서 파일 내용 읽어서 history/snapshots 에 저장
+          git fetch origin main
+          git checkout history
+          mkdir -p "snapshots/${NOW}"
+
+          for f in nickmap.json nickmap_full.json; do
+            if git cat-file -e origin/main:$f 2>/dev/null; then
+              git show origin/main:$f > "snapshots/${NOW}/$f"
+            fi
+          done
+
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "snapshot ${NOW} [skip ci]"
+            git push origin history
+          fi
+
+          git checkout main
+
+      # main을 최근 4커밋만 남기기
+      - name: trim main to last 4 commits
+        run: |
+          set -e
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          git reset --hard origin/main
+
+          COUNT=$(git rev-list --count HEAD)
+          N=4
+          if [ "$COUNT" -le "$N" ]; then
+            echo "No trim needed"; exit 0
+          fi
+
+          # 오래된 -> 최신 순으로 마지막 N개 SHA
+          mapfile -t LASTN < <(git rev-list --max-count="$N" HEAD | tac)
+
+          # 고아 브랜치에서 N개 커밋만 재작성
+          git checkout --orphan temp
+          git rm -r --cached . 2>/dev/null || true
+
+          for sha in "${LASTN[@]}"; do
+            # 워킹트리 비우고 해당 커밋의 파일만 가져와 동일 메타로 커밋
+            git rm -rf . 2>/dev/null || true
+            git checkout -f "$sha" -- .
+            COMMIT_MSG="$(git show -s --format=%s "$sha")"
+            A_NAME="$(git show -s --format=%an "$sha")"; A_EMAIL="$(git show -s --format=%ae "$sha")"; A_DATE="$(git show -s --format=%aI "$sha")"
+            C_NAME="$(git show -s --format=%cn "$sha")"; C_EMAIL="$(git show -s --format=%ce "$sha")"; C_DATE="$(git show -s --format=%cI "$sha")"
+
+            GIT_AUTHOR_NAME="$A_NAME" GIT_AUTHOR_EMAIL="$A_EMAIL" GIT_AUTHOR_DATE="$A_DATE" \
+            GIT_COMMITTER_NAME="$C_NAME" GIT_COMMITTER_EMAIL="$C_EMAIL" GIT_COMMITTER_DATE="$C_DATE" \
+              git commit -m "$COMMIT_MSG [skip ci]" || true
+          done
+
+          # temp -> main 교체
+          git branch -D main || true
+          git branch -m main
+          git push -f origin main
